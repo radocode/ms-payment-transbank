@@ -1,218 +1,189 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/base64"
 	"fmt"
-	"log"
-	"net/http"
+	rand "math/rand"
+	"time"
 
-	"goji.io"
-	"goji.io/pat"
-	"gopkg.in/mgo.v2"
+	"github.com/gin-gonic/gin"
+
+	mgo "gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
 
-func ErrorWithJSON(w http.ResponseWriter, message string, code int) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	fmt.Fprintf(w, "{message: %q}", message)
+// ========== random {{{
+
+var letterRunes = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func rndStr(n int) string {
+	rnd_str := make([]rune, n)
+	for i := range rnd_str {
+		rnd_str[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return string(rnd_str)
 }
 
-func ResponseWithJSON(w http.ResponseWriter, json []byte, code int) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	w.Write(json)
+// RandToken generates a random @length token.
+func RandToken(length int) string {
+	tbyte := make([]byte, length)
+	rand.Read(tbyte)
+	return base64.StdEncoding.EncodeToString(tbyte)
+} // }}}
+
+// ========== Data
+
+type Data struct {
+	Id   bson.ObjectId `form:"id" bson:"_id,omitempty"`
+	Data string        `form:"data" bson:"data"`
 }
 
-type Book struct {
-	ISBN    string   `json:"isbn"`
-	Title   string   `json:"title"`
-	Authors []string `json:"authors"`
-	Price   string   `json:"price"`
+// ========== MongoDB
+
+type MongoDB struct {
+	Host             string
+	Port             string
+	Addrs            string
+	Database         string
+	EventTTLAfterEnd time.Duration
+	StdEventTTL      time.Duration
+	Info             *mgo.DialInfo
+	Session          *mgo.Session
+}
+
+func (mongo *MongoDB) SetDefault() { // {{{
+	mongo.Host = "localhost"
+	mongo.Addrs = "localhost:27017"
+	mongo.Database = "context"
+	mongo.EventTTLAfterEnd = 1 * time.Second
+	mongo.StdEventTTL = 20 * time.Minute
+	mongo.Info = &mgo.DialInfo{
+		Addrs:    []string{mongo.Addrs},
+		Timeout:  60 * time.Second,
+		Database: mongo.Database,
+	}
+} // }}}
+
+func (mongo *MongoDB) Drop() (err error) { // {{{
+	session := mongo.Session.Clone()
+	defer session.Close()
+
+	err = session.DB(mongo.Database).DropDatabase()
+	if err != nil {
+		return err
+	}
+	return nil
+} // }}}
+
+func (mongo *MongoDB) Init() (err error) { // {{{
+	err = mongo.Drop()
+	if err != nil {
+		fmt.Printf("\n drop database error: %v\n", err)
+	}
+
+	data := Data{}
+	data.Data = rndStr(8)
+	err = mongo.PostData(&data)
+
+	return err
+} // }}}
+
+func (mongo *MongoDB) SetSession() (err error) {
+	mongo.Session, err = mgo.DialWithInfo(mongo.Info)
+	if err != nil {
+		mongo.Session, err = mgo.Dial(mongo.Host)
+		if err != nil {
+			return err
+		}
+	}
+	return err
+}
+
+// ========== model
+
+func (mongo *MongoDB) GetData() (dates []Data, err error) { // {{{
+	session := mongo.Session.Clone()
+	defer session.Close()
+
+	err = session.DB(mongo.Database).C("Data").Find(bson.M{}).All(&dates)
+	return dates, err
+} // }}}
+
+func (mongo *MongoDB) PostData(data *Data) (err error) { // {{{
+	session := mongo.Session.Clone()
+	defer session.Close()
+
+	err = session.DB(mongo.Database).C("Data").Insert(&data)
+	return err
+} // }}}
+
+// ========== controller
+
+func getData(c *gin.Context) { // {{{
+	mongo, ok := c.Keys["mongo"].(*MongoDB)
+	if !ok {
+		c.JSON(400, gin.H{"message": "can't reach db", "body": nil})
+	}
+
+	data, err := mongo.GetData()
+	// fmt.Printf("\ndata: %v, ok: %v\n", data, ok)
+	if err != nil {
+		c.JSON(400, gin.H{"message": "can't get data from database", "body": nil})
+	} else {
+		c.JSON(200, gin.H{"message": "get data sucess", "body": data})
+	}
+} // }}}
+
+func postData(c *gin.Context) { // {{{
+	mongo, ok := c.Keys["mongo"].(*MongoDB)
+	if !ok {
+		c.JSON(400, gin.H{"message": "can't connect to db", "body": nil})
+	}
+	var req Data
+	err := c.Bind(&req)
+	if err != nil {
+		c.JSON(400, gin.H{"message": "Incorrect data", "body": nil})
+		return
+	} else {
+		err := mongo.PostData(&req)
+		if err != nil {
+			c.JSON(400, gin.H{"message": "error post to db", "body": nil})
+		}
+		c.JSON(200, gin.H{"message": "post data sucess", "body": req})
+	}
+} // }}}
+
+// ========== middleware
+
+func MiddleDB(mongo *MongoDB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		err := mongo.SetSession()
+		if err != nil {
+			c.Abort()
+		} else {
+			c.Set("mongo", mongo)
+			c.Next()
+		}
+	}
+}
+
+// ========== start router
+
+func SetupRouter() *gin.Engine {
+	mongo := MongoDB{}
+	mongo.SetDefault()
+
+	router := gin.Default()
+	router.Use(gin.Logger())
+	router.Use(gin.Recovery())
+	router.Use(MiddleDB(&mongo))
+
+	router.GET("/data", getData)
+	router.POST("/data", postData)
+	return router
 }
 
 func main() {
-	session, err := mgo.Dial("localhost")
-	if err != nil {
-		panic(err)
-	}
-	defer session.Close()
-
-	session.SetMode(mgo.Monotonic, true)
-	ensureIndex(session)
-
-	mux := goji.NewMux()
-	mux.HandleFunc(pat.Get("/books"), allBooks(session))
-	mux.HandleFunc(pat.Post("/books"), addBook(session))
-	mux.HandleFunc(pat.Get("/books/:isbn"), bookByISBN(session))
-	mux.HandleFunc(pat.Put("/books/:isbn"), updateBook(session))
-	mux.HandleFunc(pat.Delete("/books/:isbn"), deleteBook(session))
-	http.ListenAndServe("localhost:8080", mux)
-}
-
-func ensureIndex(s *mgo.Session) {
-	session := s.Copy()
-	defer session.Close()
-
-	c := session.DB("store").C("books")
-
-	index := mgo.Index{
-		Key:        []string{"isbn"},
-		Unique:     true,
-		DropDups:   true,
-		Background: true,
-		Sparse:     true,
-	}
-	err := c.EnsureIndex(index)
-	if err != nil {
-		panic(err)
-	}
-}
-
-func allBooks(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		session := s.Copy()
-		defer session.Close()
-
-		c := session.DB("store").C("books")
-
-		var books []Book
-		err := c.Find(bson.M{}).All(&books)
-		if err != nil {
-			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
-			log.Println("Failed get all books: ", err)
-			return
-		}
-
-		respBody, err := json.MarshalIndent(books, "", "  ")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		ResponseWithJSON(w, respBody, http.StatusOK)
-	}
-}
-
-func addBook(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		session := s.Copy()
-		defer session.Close()
-
-		var book Book
-		decoder := json.NewDecoder(r.Body)
-		err := decoder.Decode(&book)
-		if err != nil {
-			ErrorWithJSON(w, "Incorrect body", http.StatusBadRequest)
-			return
-		}
-
-		c := session.DB("store").C("books")
-
-		err = c.Insert(book)
-		if err != nil {
-			if mgo.IsDup(err) {
-				ErrorWithJSON(w, "Book with this ISBN already exists", http.StatusBadRequest)
-				return
-			}
-
-			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
-			log.Println("Failed insert book: ", err)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Location", r.URL.Path+"/"+book.ISBN)
-		w.WriteHeader(http.StatusCreated)
-	}
-}
-
-func bookByISBN(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		session := s.Copy()
-		defer session.Close()
-
-		isbn := pat.Param(r, "isbn")
-
-		c := session.DB("store").C("books")
-
-		var book Book
-		err := c.Find(bson.M{"isbn": isbn}).One(&book)
-		if err != nil {
-			ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
-			log.Println("Failed find book: ", err)
-			return
-		}
-
-		if book.ISBN == "" {
-			ErrorWithJSON(w, "Book not found", http.StatusNotFound)
-			return
-		}
-
-		respBody, err := json.MarshalIndent(book, "", "  ")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		ResponseWithJSON(w, respBody, http.StatusOK)
-	}
-}
-
-func updateBook(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		session := s.Copy()
-		defer session.Close()
-
-		isbn := pat.Param(r, "isbn")
-
-		var book Book
-		decoder := json.NewDecoder(r.Body)
-		err := decoder.Decode(&book)
-		if err != nil {
-			ErrorWithJSON(w, "Incorrect body", http.StatusBadRequest)
-			return
-		}
-
-		c := session.DB("store").C("books")
-
-		err = c.Update(bson.M{"isbn": isbn}, &book)
-		if err != nil {
-			switch err {
-			default:
-				ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
-				log.Println("Failed update book: ", err)
-				return
-			case mgo.ErrNotFound:
-				ErrorWithJSON(w, "Book not found", http.StatusNotFound)
-				return
-			}
-		}
-
-		w.WriteHeader(http.StatusNoContent)
-	}
-}
-
-func deleteBook(s *mgo.Session) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		session := s.Copy()
-		defer session.Close()
-
-		isbn := pat.Param(r, "isbn")
-
-		c := session.DB("store").C("books")
-
-		err := c.Remove(bson.M{"isbn": isbn})
-		if err != nil {
-			switch err {
-			default:
-				ErrorWithJSON(w, "Database error", http.StatusInternalServerError)
-				log.Println("Failed delete book: ", err)
-				return
-			case mgo.ErrNotFound:
-				ErrorWithJSON(w, "Book not found", http.StatusNotFound)
-				return
-			}
-		}
-
-		w.WriteHeader(http.StatusNoContent)
-	}
+	router := SetupRouter()
+	router.Run()
 }
